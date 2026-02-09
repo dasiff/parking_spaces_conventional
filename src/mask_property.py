@@ -41,7 +41,7 @@ def load_polygon(polygon_path):
         
         return polygon_coords
     except Exception as e:
-        print(f"Error loading polygon: {e}")
+        print(f"Error loading polygon from {polygon_path}: {e}")
         return None
 
 

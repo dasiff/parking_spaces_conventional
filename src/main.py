@@ -27,8 +27,14 @@ def main():
         polygon_path = sys.argv[2]
     else:
         # Use default paths - look for any image in data/ and polygon in polygons/
-        image_files = [f for f in os.listdir(data_dir) if f.endswith(('.jpg', '.jpeg', '.png'))] if os.path.exists(data_dir) else []
-        polygon_files = [f for f in os.listdir(polygon_dir) if f.endswith('.txt')] if os.path.exists(polygon_dir) else []
+        image_files = []
+        polygon_files = []
+        
+        if os.path.exists(data_dir):
+            image_files = [f for f in os.listdir(data_dir) if f.endswith(('.jpg', '.jpeg', '.png'))]
+        
+        if os.path.exists(polygon_dir):
+            polygon_files = [f for f in os.listdir(polygon_dir) if f.endswith('.txt')]
         
         if not image_files or not polygon_files:
             print("Usage: python main.py <image_path> <polygon_path>")
@@ -60,9 +66,13 @@ def main():
         return
     
     # Create a Shapely polygon for validation
-    polygon = Polygon(polygon_coords)
-    print(f"Polygon loaded with {len(polygon_coords)} vertices")
-    print(f"Polygon area: {polygon.area:.2f} square pixels")
+    try:
+        polygon = Polygon(polygon_coords)
+        print(f"Polygon loaded with {len(polygon_coords)} vertices")
+        print(f"Polygon area: {polygon.area:.2f} square pixels")
+    except Exception as e:
+        print(f"Error: Invalid polygon geometry - {e}")
+        return
     
     # Draw the polygon on the image
     result_image = draw_polygon_on_image(image, polygon_coords)

@@ -2,8 +2,6 @@ import cv2
 import numpy as np
 import os
 
-K_SIZE=40
-
 def extract_red_boundary(image):
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
@@ -27,7 +25,7 @@ def thicken(mask):
     return cv2.dilate(mask, kernel, iterations=1)
 
 
-def close_gaps(mask, k_size=50):
+def close_gaps(mask, k_size=100):
     kernel = np.ones((k_size,k_size), np.uint8)
     closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     return closed
@@ -69,32 +67,37 @@ def fill_inside(boundary_mask):
     return filled
 
 
-def extract_property_region(image, image_name="sample"):
+def extract_property_region(image, image_name="sample", debug=False):
     red = extract_red_boundary(image)
-    cv2.imwrite(os.path.join("outputs", "01_" + image_name + '_raw.png'), red)
+    if debug:
+        cv2.imwrite(os.path.join("outputs", "01_" + image_name + '_raw.png'), red)
     thick = thicken(red)
-    cv2.imwrite(os.path.join("outputs", "02_" + image_name + "_thick.png"), thick)
+    if debug:
+        cv2.imwrite(os.path.join("outputs", "02_" + image_name + "_thick.png"), thick)
     closed = close_gaps(thick)
-    cv2.imwrite(os.path.join("outputs", "03_" + image_name + "_closed.png"), closed)
+    if debug:
+        cv2.imwrite(os.path.join("outputs", "03_" + image_name + "_closed.png"), closed)
     main = keep_largest_component(closed)
     filled = fill_inside(main)
     return filled
 
 
-def prop_mask(root_path=r"G:\\My Drive\\parking_spaces\\data\\raw_images", image_name="Mta_Company_9400_N_Central_Expy_Dallas_TX_75231_0800_United_States"):
+def prop_mask(root_path=r"G:\\My Drive\\parking_spaces\\data\\raw_images", image_name="Mta_Company_9400_N_Central_Expy_Dallas_TX_75231_0800_United_States", debug=False):
     image_path = os.path.join(root_path, image_name + ".png")
     image = cv2.imread(image_path)
 
     if image is None:
         raise FileNotFoundError(f"Could not load image at {image_path}")
 
-    property_mask = extract_property_region(image, image_name)
+    property_mask = extract_property_region(image, image_name, debug)
     out_path = os.path.join("outputs", f"04_property_mask_{image_name}.png")
-    cv2.imwrite(out_path, property_mask)
+    if debug:
+        cv2.imwrite(out_path, property_mask)
 
-    print(f"Saved property mask to {out_path}.")
-    return property_mask
+    if debug:
+        print(f"Saved property mask to {out_path}.")
+    return image, property_mask
 
 
 if __name__ == "__main__":
-    prop_mask()
+    prop_mask(debug=True)

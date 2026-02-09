@@ -1,0 +1,203 @@
+10 session plan
+
+Updated 10-Session Checklist (Regime-Based)
+
+Each session = 4 hours, each ends with code + artifact.
+
+Session 1: Property Mask + Debug Overlay
+
+Goal: Everything restricted correctly.
+
+Tasks:
+
+load image
+
+rasterize polygon mask
+
+apply ROI
+
+save overlay
+
+Deliverable:
+
+01_property_mask.py
+
+Session 2: Candidate Region Proposal (Asphalt Blobs)
+
+Goal: Find paved areas without ML.
+
+Tasks:
+
+HSV threshold for asphalt
+
+remove buildings (bright blobs)
+
+morphology cleanup
+
+connected components
+
+Deliverable:
+
+02_region_proposal.py
+
+regions outlined
+
+Session 3: Region Feature Extraction (Regime Signals)
+
+Goal: Compute diagnostics per region.
+
+Tasks:
+
+edge density
+
+line density
+
+orientation histogram strength
+
+car-coverage proxy (optional)
+
+Deliverable:
+
+03_region_features.py
+
+table of region stats
+
+Session 4: Regime Classifier (A/B/C Decision)
+
+Goal: Automatic regime assignment.
+
+Tasks:
+
+define thresholds
+
+classify each region
+
+visualize regime labels
+
+Deliverable:
+
+04_regime_classifier.py
+
+regions colored by regime
+
+Session 5: Method A Prototype (Line Extraction)
+
+Goal: Stall lines detected in Regime A.
+
+Tasks:
+
+CLAHE + Canny
+
+LSD/Hough segments
+
+filter short segments
+
+Deliverable:
+
+05_methodA_lines.py
+
+line overlay
+
+Session 6: Method A Counting (Spacing + Rows)
+
+Goal: Accurate count on one clear lot.
+
+Tasks:
+
+orientation clustering
+
+spacing inference via projection peaks
+
+count stalls row-by-row
+
+Deliverable:
+
+06_methodA_count.py
+
+count within ~5–10%
+
+Session 7: Confidence Model for Method A
+
+Goal: High-confidence outputs only.
+
+Tasks:
+
+spacing consistency metric
+
+min segment count
+
+confidence score formula
+
+Deliverable:
+
+07_confidence_A.py
+
+Session 8: Method B Prototype (Occlusion Grid Extrapolation)
+
+Goal: Handle dense-car lots with partial paint.
+
+Tasks:
+
+reuse orientation from weak lines
+
+estimate spacing from subset
+
+propagate grid through occluded areas
+
+Deliverable:
+
+08_methodB_extrapolate.py
+
+medium-confidence count
+
+Session 9: Method C Reject Logic + Manual Review Flag
+
+Goal: No hallucinations.
+
+Tasks:
+
+detect “no evidence” regions
+
+return null/flag
+
+generate QA overlay
+
+Deliverable:
+
+09_methodC_reject.py
+
+Session 10: Full System Integration + Speed Benchmark
+
+Goal: End-to-end <200ms.
+
+Tasks:
+
+pipeline wrapper:
+count_stalls(image, polygon)
+
+method switching
+
+timing breakdown
+
+JSON + overlay output
+
+Deliverable:
+
+10_full_system.py
+
+benchmark report
+
+Target runtime:
+
+Region proposal: <20ms
+
+Method A: <100ms
+
+Method B: <150ms
+
+Total: <200ms
+
+Boundary adjustment issue:
+-snap to closest contours using mse compared to parallel contours?
+-leverage fact that adjustment is on a gaussian curve?
+nn: needs to preserve aspect ratio; predictions were way off (small error creates large diffc--vanilla nn made things worse)

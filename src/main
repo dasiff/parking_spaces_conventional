@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import os
 import sys
+from parking_lot_proposal import parking_lot_proposal
 # ensure the script directory is on sys.path so sibling modules (e.g., extract_boundary) can be imported
 sys.path.insert(0, os.path.dirname(__file__))
 from extract_boundary import prop_mask
@@ -11,11 +12,15 @@ def main():
     # ---- Paths ----
     print("main called")
     image_root = r"G:\\My Drive\\parking_spaces\\data\\raw_images"
-    image_names=["Mta_Company_9400_N_Central_Expy_Dallas_TX_75231_0800_United_States","Doubletree_by_Hilton_Hotel_Dallas_Campbell_Centre_8250_N_Central_Expy_Dallas_TX_75206_United_States","Drey_Hotel_5630_Village_Glen_Dr_Dallas_TX_75206_United_States","La_Quinta_Inn_by_Wyndham_Dallas_Uptown_4440_N_Central_Expy_Dallas_TX_75206_United_States"]
+    #hard_images=["Drey_Hotel_5630_Village_Glen_Dr_Dallas_TX_75206_United_States"","Doubletree_by_Hilton_Hotel_Dallas_Campbell_Centre_8250_N_Central_Expy_Dallas_TX_75206_United_States","La_Quinta_Inn_by_Wyndham_Dallas_Uptown_4440_N_Central_Expy_Dallas_TX_75206_United_States"]
+    image_names=["Mta_Company_9400_N_Central_Expy_Dallas_TX_75231_0800_United_States","Hotel_Swexan_2575_McKinnon_St_Dallas_TX_75201_United_States","Warwick_Melrose_Hotel_3015_Oak_Lawn_Ave_Dallas_TX_75219_United_States"]
     #polygon_path = "data/boundaries.json"
     for image_name in image_names:
-        print("processing ",image_name)
-        mask=prop_mask(image_root,image_name)
+        image, mask=prop_mask(image_root,image_name, debug=False)
+        print("found mask for ",image_name)
+        mask, regions, score_map=parking_lot_proposal(image, mask, image_name, debug=True)
+        print("found ",len(regions)," for ",image_name)
+
 
 
 

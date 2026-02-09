@@ -9,6 +9,12 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
+data/
+outputs/
+__pycache__/
+*.pyc
+.env
+.DS_Store
 develop-eggs/
 dist/
 downloads/

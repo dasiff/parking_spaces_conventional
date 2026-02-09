@@ -1,0 +1,24 @@
+import json
+import cv2
+import numpy as np
+import os
+import sys
+# ensure the script directory is on sys.path so sibling modules (e.g., extract_boundary) can be imported
+sys.path.insert(0, os.path.dirname(__file__))
+from extract_boundary import prop_mask
+
+def main():
+    # ---- Paths ----
+    print("main called")
+    image_root = r"G:\\My Drive\\parking_spaces\\data\\raw_images"
+    image_names=["Mta_Company_9400_N_Central_Expy_Dallas_TX_75231_0800_United_States","Doubletree_by_Hilton_Hotel_Dallas_Campbell_Centre_8250_N_Central_Expy_Dallas_TX_75206_United_States","Drey_Hotel_5630_Village_Glen_Dr_Dallas_TX_75206_United_States","La_Quinta_Inn_by_Wyndham_Dallas_Uptown_4440_N_Central_Expy_Dallas_TX_75206_United_States"]
+    #polygon_path = "data/boundaries.json"
+    for image_name in image_names:
+        print("processing ",image_name)
+        mask=prop_mask(image_root,image_name)
+
+
+
+
+if __name__ == "__main__":
+    main()

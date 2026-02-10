@@ -1,0 +1,23 @@
+NAVIGATE
+| A/D  prev/next image in folder
+ZOOM
+  + / -     zoom in / out
+  0  fit image   1   fit property
+PAN
+  Arrow keys        move image
+  Shift + arrows    fast pan
+LABEL
+  Left-Click        create stall center
+  Move mouse        preview direction
+  Left-Click        commit
+  Esc               cancel / undo
+  L                 lock/unlock arrow orientation
+  Right-click       delete stall
+BOUNDARY_adjust:
+  B                 turn boundary adjust mode on/off
+  R                 revert to original boundary
+  arrows            adjust dx/dy (shift to move faster)
+  </>               adjust orientation (rotate boundary)
+DISPLAY:
+   O                Hide/show boundary
+For parallel parking, arrow points to nose of car

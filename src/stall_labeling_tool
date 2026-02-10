@@ -1,0 +1,1801 @@
+import json
+from pathlib import Path
+
+import math
+import os
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import List, Optional, Tuple
+import numpy as np
+import cv2
+from PySide6.QtCore import Qt, QPointF, QRectF, QSize, QTimer
+from PySide6.QtGui import (
+    QAction, QImage, QColor, QFont, QKeySequence, QPainter, QPen, QPixmap
+)
+from PySide6.QtWidgets import (
+    QApplication, QCheckBox, QFileDialog, QHBoxLayout, QLabel, QMainWindow,
+    QMessageBox, QPushButton, QSplitter, QVBoxLayout, QWidget, QListWidget,
+    QListWidgetItem, QPlainTextEdit
+)
+
+
+# -----------------------------
+# Image enhancement helpers
+# -----------------------------
+
+try:
+    from data_preprocessing import clahe_enhance_bgr
+except Exception:
+    try:
+        from .data_preprocessing import clahe_enhance_bgr
+    except Exception:
+        # Fallback: no-op if import fails (keeps display working without enhancement)
+        def clahe_enhance_bgr(img, *args, **kwargs):
+            return img
+
+# -----------------------------
+# Data model
+# -----------------------------
+
+@dataclass
+class Stall:
+    x: float
+    y: float
+    theta: float  # radians, in [0, pi)
+
+    def to_dict(self):
+        return {"x": self.x, "y": self.y, "theta": self.theta}
+
+
+@dataclass
+class ImageLabels:
+    image_path: str
+    stalls: List[Stall]
+    boundary_adjust: dict  # {"dx": float, "dy": float, "dtheta": float}
+    skipped: bool = False
+    needs_review: bool = False
+    notes: str = ""
+    # whether the boundary is known to be bad/incorrect (user marked)
+    boundary_bad: bool = False
+
+    def to_json(self):
+        return {
+            "image_path": self.image_path,
+            "needs_review": self.needs_review,
+            "notes": self.notes,
+            "stalls": [s.to_dict() for s in self.stalls],
+            "boundary_adjust": self.boundary_adjust if hasattr(self, "boundary_adjust") else {},
+            "boundary_bad": bool(getattr(self, "boundary_bad", False)),
+        }
+
+
+# -----------------------------
+# Canvas widget
+# -----------------------------
+
+class LabelCanvas(QWidget):
+    """
+    Draws image + overlays and handles:
+      - click center then click direction
+      - preview arrow follows mouse after first click
+      - zoom/pan
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._dragging = False
+        self._drag_idx = None
+        self._drag_mode = None  # 'center' or 'tip'
+        self.lock_orientation = False
+        self.default_theta = 0.0  # radians
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.adjust_boundary_mode = False
+
+        # Image state
+        self.pixmap: Optional[QPixmap] = None
+        self.image_path: Optional[Path] = None
+        self.cleaned_cache={} #cache for cleaned images
+
+        # Labels for current image
+        self.stalls: List[Stall] = []
+        self._undo_stack: List[List[Stall]] = []
+        self._redo_stack: List[List[Stall]] = []
+        self.boundary_poly_raw=None  #list of [(x,y)] vertices for boundary
+        self.boundary_poly_adj=None  #list of [(x,y)] vertices after adjustment
+        self.boundary_contour=None #numpy array for cv2 
+        self.boundary_dx = 0.0
+        self.boundary_dy = 0.0
+        self.boundary_dtheta = 0.0
+        # flag to mark that the loaded boundary is bad / incorrect
+        self.boundary_bad = False
+
+        # In-progress stall
+        self.center_pt: Optional[QPointF] = None
+        self.mouse_pt: Optional[QPointF] = None  # in image coords
+        
+        # View transform (image coords -> widget coords)
+        self.scale: float = 1.0
+        self.offset: QPointF = QPointF(0, 0)  # widget-space offset
+        self._panning: bool = False
+        self._pan_start: Optional[QPointF] = None
+        self._offset_start: Optional[QPointF] = None
+
+        # Overlays
+        self.show_boundary = True
+        self.show_prop_mask = False
+        self.boundary_poly: Optional[List[Tuple[float, float]]] = None  # image coords
+        self.prop_mask_pixmap: Optional[QPixmap] = None  # alpha overlay
+
+        # Display config
+        self.arrow_len_px = 28  # fixed display arrow length (in image coords, scaled visually)
+        self._dirty = False
+
+    # ---------- public API ----------
+
+    def is_dirty(self) -> bool:
+        return self._dirty
+
+    def set_dirty(self, val: bool):
+        self._dirty = val
+        self.update()
+
+    def set_image(self, image_bgr: np.ndarray, image_path: Path, enhance: bool = False):
+        """Set the current image shown on the canvas.
+
+        If `enhance` is True, the module-level `clahe_enhance_bgr` helper is applied
+        to produce a visually enhanced image for display. The original image is
+        still kept in `self.image_bgr` so the raw pixels are available for saving
+        or for non-visual processing.
+        """
+        self.image_path = image_path
+        self.image_bgr = image_bgr  # canonical copy
+
+        display_img = clahe_enhance_bgr(image_bgr) if enhance else image_bgr
+
+        h, w = display_img.shape[:2]
+        qimg = QImage(
+            display_img.data,
+            w,
+            h,
+            display_img.strides[0],
+            QImage.Format_BGR888
+        )
+        self.pixmap = QPixmap.fromImage(qimg)
+
+        self.fit_to_view()
+        self.center_pt = None
+        self.mouse_pt = None
+        self.update()
+        
+    def set_labels(self, stalls: List[Stall]):
+        self.stalls = list(stalls)
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self.set_dirty(False)
+        self.center_pt = None
+        self.mouse_pt = None
+        self.update()
+
+    def _stall_tip_point(self, s: Stall, L: float) -> QPointF:
+        return QPointF(s.x + L * math.cos(s.theta), s.y + L * math.sin(s.theta))
+
+    def hit_test(self, p_img: QPointF):
+        """
+        Returns (index, mode) where mode is 'center' or 'tip', or (None, None).
+        """
+        if not self.stalls:
+            return None, None
+
+        # thresholds in image pixels; adjust for zoom so it feels consistent on screen
+        r_screen = 10  # pixels on screen
+        r_img = r_screen / max(self.scale, 1e-6)
+
+        best_i = None
+        best_mode = None
+        best_d = 1e9
+
+        for i, s in enumerate(self.stalls):
+            c = QPointF(s.x, s.y)
+            d_center = (p_img.x() - c.x())**2 + (p_img.y() - c.y())**2
+            if d_center < best_d and d_center <= (r_img**2):
+                best_d = d_center
+                best_i = i
+                best_mode = "center"
+
+            tip = self._stall_tip_point(s, self.arrow_len_px)
+            d_tip = (p_img.x() - tip.x())**2 + (p_img.y() - tip.y())**2
+            if d_tip < best_d and d_tip <= (r_img**2):
+                best_d = d_tip
+                best_i = i
+                best_mode = "tip"
+
+        return best_i, best_mode
+
+
+    #--- polygon logic
+
+    def erase_boundary_on_open(self, img_bgr, poly_pts, thickness=10, pad=60, radius=3):
+        H, W = img_bgr.shape[:2]
+        # poly_pts is expected to be an iterable of (x,y) pairs. Convert safely to an (N,2) int32 array.
+        try:
+            pts = np.array(poly_pts, dtype=np.int32)
+            if pts.ndim != 2 or pts.shape[1] != 2:
+                raise ValueError(f"boundary polygon must be Nx2, got shape={pts.shape}")
+        except Exception:
+            # invalid polygon: return original image unchanged
+            return img_bgr
+
+        # bbox + pad
+        x0, y0 = pts[:,0].min(), pts[:,1].min()
+        x1, y1 = pts[:,0].max(), pts[:,1].max()
+        x0 = max(0, x0 - pad); y0 = max(0, y0 - pad)
+        x1 = min(W-1, x1 + pad); y1 = min(H-1, y1 + pad)
+
+        roi = img_bgr[y0:y1+1, x0:x1+1].copy()
+
+        # shift pts into ROI coordinates
+        pts_roi = pts.copy()
+        pts_roi[:,0] -= x0
+        pts_roi[:,1] -= y0
+
+        # mask initial polyline (small thickness)
+        mask = np.zeros(roi.shape[:2], dtype=np.uint8)
+        draw_thickness = max(int(thickness), 6)
+        cv2.polylines(mask, [pts_roi.reshape(-1,1,2)], True, 255, draw_thickness, lineType=cv2.LINE_AA)
+
+        # small dilate to cover boundary
+        k = max(5, draw_thickness)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        mask = cv2.dilate(mask, kernel, iterations=1)
+
+        # color-based filter: identify red pixels in ROI (BGR)
+        b = roi[:, :, 0].astype(int)
+        g = roi[:, :, 1].astype(int)
+        r = roi[:, :, 2].astype(int)
+        red_cond = (r > 140) & (r > g + 40) & (r > b + 40)
+
+        # final mask: pixels both near polyline and red
+        final_mask = (mask > 0) & red_cond
+
+        if final_mask.sum() == 0:
+            # fallback: if color filter finds nothing, use drawn mask region only
+            final_mask = (mask > 0)
+
+        inpaint_mask = (final_mask.astype(np.uint8) * 255)
+        inpaint_radius = max(3, draw_thickness // 2)
+        clean_roi = cv2.inpaint(roi, inpaint_mask, inpaint_radius, cv2.INPAINT_TELEA)
+
+        # paste back only where final_mask is True to avoid changing other pixels
+        out = img_bgr.copy()
+        roi_out = out[y0:y1+1, x0:x1+1]
+        roi_out[final_mask] = clean_roi[final_mask]
+        out[y0:y1+1, x0:x1+1] = roi_out
+
+        # paste back
+        out = img_bgr.copy()
+        out[y0:y1+1, x0:x1+1] = clean_roi
+        return out
+
+
+    def recompute_adjusted_boundary(self):
+        if not self.boundary_poly_raw:
+            self.boundary_poly_adj = None
+            self.boundary_contour = None
+            return
+
+        # use the instance transform helper
+        self.boundary_poly_adj = self.transform_poly(
+            self.boundary_poly_raw,
+            self.boundary_dx,
+            self.boundary_dy,
+            self.boundary_dtheta,
+            center=None,   # centroid rotation
+        )
+        if self.boundary_poly_adj:
+            self.boundary_contour = np.array(self.boundary_poly_adj, dtype=np.float32).reshape(-1, 1, 2)
+        else:
+            self.boundary_contour = None
+        self.update()
+
+
+    def boundary_path_for_image(self, img_path: Path) -> Path:
+        return img_path.with_name(f"{img_path.stem}_meta.json")
+
+    def load_boundary_polygon(self, img_path: Path):
+        """
+        Returns polygon as list[(x,y)] in IMAGE PIXEL coords.
+        This supports several common JSON schemas; extend as needed.
+        """
+        jp = self.boundary_path_for_image(img_path)
+        if not jp.exists():
+            # try to find a same-folder candidate of form *_meta.json with a similar stem
+            for p in img_path.parent.glob("*_meta.json"):
+                try:
+                    s = p.stem
+                    s_no_meta = s[:-5] if s.endswith("_meta") else s
+                    img_stem = img_path.stem
+                    if s in img_stem or s_no_meta in img_stem or img_stem in s:
+                        jp = p
+                        break
+                except Exception:
+                    print("no source found for border")
+                    continue
+
+        if not jp.exists():
+            return None
+
+        data = json.loads(jp.read_text(encoding="utf-8"))
+        # remember which file we used
+
+        # Try several common keys/formats (pixel coords expected):
+        # - 'boundary_pixel_coords': [[x,y],...]
+        # - 'polygon': [[x,y],...]
+        # - 'points': [[x,y],...]
+        # - top-level list: [[x,y],...]
+        pts = None
+
+        if isinstance(data, dict):
+            if "boundary_pixel_coords" in data:
+                pts = data["boundary_pixel_coords"]
+            elif "polygon" in data:
+                pts = data["polygon"]
+            elif "points" in data:
+                pts = data["points"]
+            # some files nest polygon under other keys
+            elif "boundary" in data and isinstance(data["boundary"], dict) and "pixel_coords" in data["boundary"]:
+                pts = data["boundary"]["pixel_coords"]
+        elif isinstance(data, list):
+            pts = data
+
+        if not pts:
+            # Not recognized
+            return None
+
+        return [(float(x), float(y)) for x, y in pts]
+
+    def detect_boundary_from_image(self, image_bgr: np.ndarray):
+        """Attempt to detect a bright-red boundary painted around the parking lot.
+
+        Returns (poly, confidence) where poly is list of (x,y) in image pixel coords,
+        or (None, 0.0) if detection failed. Uses HSV red thresholding, morphological
+        opening/closing at multiple scales, selects the largest connected component,
+        and approximates its contour with cv2.approxPolyDP. If multiple segments are
+        present, attempts to stitch them end-to-end using a nearest-neighbor ordering
+        of component centroids (a simple KNN-style stitch). Does not use convex hull.
+        """
+        if image_bgr is None:
+            return None, 0.0
+
+        h, w = image_bgr.shape[:2]
+        img_area = float(h * w)
+
+        # HSV threshold for bright red (two hue ranges)
+        hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+        lower1 = np.array([0, 80, 80], dtype=np.uint8)
+        upper1 = np.array([10, 255, 255], dtype=np.uint8)
+        lower2 = np.array([170, 80, 80], dtype=np.uint8)
+        upper2 = np.array([180, 255, 255], dtype=np.uint8)
+        m1 = cv2.inRange(hsv, lower1, upper1)
+        m2 = cv2.inRange(hsv, lower2, upper2)
+        mask = cv2.bitwise_or(m1, m2)
+
+        # quick bail: insufficient red
+        if cv2.countNonZero(mask) < max(100, int(0.0005 * img_area)):
+            return None, 0.0
+
+        # morphological preprocessing: try increasing kernel sizes to close gaps
+        min_dim = min(h, w)
+        scales = [max(3, int(min_dim / 400)), max(5, int(min_dim / 200)), max(9, int(min_dim / 100))]
+        processed = None
+        labels_stats = None
+        for ks in scales:
+            try:
+                k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
+                m = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
+                m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k, iterations=1)
+
+                num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(m, connectivity=8)
+                if num_labels <= 1:
+                    continue
+                areas = stats[1:, cv2.CC_STAT_AREA]
+                if areas.size == 0:
+                    continue
+                # keep only components of a reasonable size
+                large_idxs = np.where(areas >= max(200, 0.0003 * img_area))[0]
+                if large_idxs.size == 0:
+                    continue
+
+                # if there is one dominant component, use it
+                if large_idxs.size == 1:
+                    max_idx = int(large_idxs[0]) + 1
+                    comp_mask = (labels == max_idx).astype('uint8') * 255
+                    processed = comp_mask
+                    labels_stats = (labels, stats)
+                    break
+
+                # multiple components: try to merge nearby small components with larger ones
+                min_dim = min(h, w)
+                close_merge_thresh = max(8, int(min_dim * 0.01))  # pixels
+
+                # build bounding boxes for all labels (index offset of 1)
+                boxes = []
+                for i in range(1, num_labels):
+                    x = int(stats[i, cv2.CC_STAT_LEFT])
+                    y = int(stats[i, cv2.CC_STAT_TOP])
+                    ww = int(stats[i, cv2.CC_STAT_WIDTH])
+                    hh = int(stats[i, cv2.CC_STAT_HEIGHT])
+                    boxes.append((x, y, x + ww - 1, y + hh - 1))
+
+                include = set(int(i) for i in large_idxs)
+                # include nearby small components that are close to any large component
+                small_idxs = [i for i in range(len(areas)) if i not in large_idxs]
+                for si in small_idxs:
+                    sx0, sy0, sx1, sy1 = boxes[si]
+                    for li in large_idxs:
+                        lx0, ly0, lx1, ly1 = boxes[int(li)]
+                        dx = max(0, max(lx0 - sx1, sx0 - lx1))
+                        dy = max(0, max(ly0 - sy1, sy0 - ly1))
+                        dist = math.hypot(dx, dy)
+                        if dist <= close_merge_thresh:
+                            include.add(si)
+                            include.add(int(li))
+                            break
+
+                if include:
+                    combined = np.zeros_like(m)
+                    for ii in include:
+                        combined[labels == (ii + 1)] = 255
+
+                    kk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(3, ks // 2), max(3, ks // 2)))
+                    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kk, iterations=1)
+
+                    num2, labels2, stats2, centroids2 = cv2.connectedComponentsWithStats(combined, connectivity=8)
+                    if num2 <= 1:
+                        continue
+                    # choose the largest connected merged component
+                    areas2 = stats2[1:, cv2.CC_STAT_AREA]
+                    max_idx2 = int(np.argmax(areas2)) + 1
+                    comp_mask = (labels2 == max_idx2).astype('uint8') * 255
+                    processed = comp_mask
+                    labels_stats = (labels2, stats2)
+                    break
+
+                # fallback: combine the large components into one mask and try closing gaps
+                combined = np.zeros_like(m)
+                for li in large_idxs:
+                    combined[labels == (li + 1)] = 255
+
+                # small morphological close to bridge remaining small gaps
+                kk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(3, ks//2), max(3, ks//2)))
+                combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kk, iterations=1)
+
+                # recompute connected components on combined
+                num2, labels2, stats2, centroids2 = cv2.connectedComponentsWithStats(combined, connectivity=8)
+                if num2 <= 1:
+                    continue
+                # choose the largest connected merged component
+                areas2 = stats2[1:, cv2.CC_STAT_AREA]
+                max_idx2 = int(np.argmax(areas2)) + 1
+                comp_mask = (labels2 == max_idx2).astype('uint8') * 255
+                processed = comp_mask
+                labels_stats = (labels2, stats2)
+                break
+            except Exception:
+                continue
+
+        if processed is None:
+            return None, 0.0
+
+        contours, _ = cv2.findContours(processed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if not contours:
+            return None, 0.0
+
+        # if we have exactly one good contour, use it
+        if len(contours) == 1:
+            best = contours[0]
+        else:
+            # if multiple, pick by area first
+            areas = [cv2.contourArea(c) for c in contours]
+            best_idx = int(np.argmax(areas))
+            # if the largest doesn't dominate, attempt to stitch using centroid ordering
+            if areas[best_idx] < 0.75 * sum(areas):
+                # build centroid list
+                centroids = [tuple(np.mean(c.reshape(-1,2), axis=0)) for c in contours]
+                # greedy nearest neighbor order starting from largest area contour
+                order = [best_idx]
+                used = set(order)
+                while len(order) < len(contours):
+                    last = order[-1]
+                    last_c = centroids[last]
+                    # find nearest centroid not used
+                    dists = [((cx-last_c[0])**2 + (cy-last_c[1])**2) if i not in used else float('inf') for i,(cx,cy) in enumerate(centroids)]
+                    nxt = int(np.argmin(dists))
+                    if nxt in used:
+                        break
+                    order.append(nxt)
+                    used.add(nxt)
+
+                # stitch contours in order by connecting nearest points between successive contours
+                stitched = []
+                for idx_i, ci in enumerate(order):
+                    cpts = contours[ci].reshape(-1,2)
+                    if idx_i == 0:
+                        stitched = [tuple(p) for p in cpts]
+                        continue
+                    # find nearest pair between stitched end and contour points
+                    stitched_last = stitched[-1]
+                    dists = np.sum((cpts - np.array(stitched_last))**2, axis=1)
+                    j = int(np.argmin(dists))
+                    # rotate contour points so that j is first
+                    pts_ordered = np.vstack((cpts[j:], cpts[:j]))
+                    # append them
+                    stitched.extend([tuple(p) for p in pts_ordered])
+
+                best = np.array(stitched, dtype=np.int32).reshape(-1,1,2)
+            else:
+                best = contours[best_idx]
+
+        perim = cv2.arcLength(best, True)
+        if perim <= 10:
+            return None, 0.0
+
+        epsilon = max(1.0, 0.0025 * perim)
+        try:
+            approx = cv2.approxPolyDP(best, epsilon, True)
+        except Exception:
+            approx = best
+
+        poly = [(float(pt[0][0]), float(pt[0][1])) for pt in approx]
+        mask_area = float(cv2.countNonZero(processed))
+        conf = min(0.99, max(0.01, mask_area / img_area))
+
+        if len(poly) < 4 or conf < 0.005:
+            return None, 0.0
+
+        return poly, float(conf)
+
+    def transform_poly(self, poly, dx, dy, dtheta, center=None):
+        """
+        Rotate by dtheta around center (image center by default), then translate by dx,dy.
+        poly: list[(x,y)]
+        """
+        if not poly:
+            return None
+
+        if center is None:
+            # rotate around polygon centroid (good default)
+            cx = sum(x for x,_ in poly) / len(poly)
+            cy = sum(y for _,y in poly) / len(poly)
+        else:
+            cx, cy = center
+
+        ct = math.cos(dtheta)
+        st = math.sin(dtheta)
+
+        out = []
+        for x, y in poly:
+            xr = x - cx
+            yr = y - cy
+            x2 = ct * xr - st * yr + cx + dx
+            y2 = st * xr + ct * yr + cy + dy
+            out.append((x2, y2))
+        return out
+
+
+    def set_boundary_polygon(self, poly):
+        # store the raw polygon and recompute adjusted polygon
+        self.boundary_poly = poly
+        self.boundary_poly_raw = poly
+        if poly is None:
+            self.boundary_poly_adj = None
+            self.boundary_contour = None
+            self.update()
+            return
+
+        # recompute adjusted polygon (applies dx/dy/dtheta)
+        self.recompute_adjusted_boundary()
+        self.update()
+
+
+    def point_inside_boundary(self, p_img) -> bool:
+        """Return True if the given point (in image coords) is inside the current adjusted boundary.
+        Falls back to a pure-Python ray-casting test if OpenCV contour is not available for any reason."""
+        x, y = float(p_img.x()), float(p_img.y())
+        has_contour = self.boundary_contour is not None
+        result = True
+
+        if has_contour:
+            try:
+                result = cv2.pointPolygonTest(self.boundary_contour, (x, y), False) >= 0
+            except Exception:
+                has_contour = False
+                result = True
+
+        if not has_contour and self.boundary_poly_raw:
+            # fallback: ray-casting algorithm on the raw polygon (works on any list of verts)
+            result = self._point_in_poly_python(x, y, self.boundary_poly_adj or self.boundary_poly_raw)
+
+        return bool(result)
+
+    def _point_in_poly_python(self, x: float, y: float, poly: List[Tuple[float, float]]) -> bool:
+        # ray casting algorithm
+        inside = False
+        n = len(poly)
+        if n < 3:
+            return False
+        j = n - 1
+        for i in range(n):
+            xi, yi = poly[i]
+            xj, yj = poly[j]
+            intersect = ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi)
+            if intersect:
+                inside = not inside
+            j = i
+        return inside
+
+    def set_property_mask_overlay(self, mask_png_path: Optional[Path]):
+        """
+        Optional: if you have a precomputed property mask PNG with alpha/white,
+        load it and draw with translucency.
+        """
+        if mask_png_path is None or (not mask_png_path.exists()):
+            self.prop_mask_pixmap = None
+        else:
+            pm = QPixmap(str(mask_png_path))
+            self.prop_mask_pixmap = None if pm.isNull() else pm
+        self.update()
+
+    # ---------- geometry helpers ----------
+
+    def img_to_widget(self, p: QPointF) -> QPointF:
+        return QPointF(p.x() * self.scale + self.offset.x(), p.y() * self.scale + self.offset.y())
+
+    def widget_to_img(self, p: QPointF) -> QPointF:
+        return QPointF((p.x() - self.offset.x()) / self.scale, (p.y() - self.offset.y()) / self.scale)
+
+    def fit_to_view(self):
+        if not self.pixmap:
+            return
+        w = max(1, self.width())
+        h = max(1, self.height())
+        iw = self.pixmap.width()
+        ih = self.pixmap.height()
+        s = min(w / iw, h / ih)
+        self.scale = s
+        # center it
+        ox = (w - iw * s) / 2.0
+        oy = (h - ih * s) / 2.0
+        self.offset = QPointF(ox, oy)
+        self.clamp_offset()
+
+    def commit_stall_with_theta(self, center_img: QPointF, theta: float):
+        self.push_undo()
+        self.stalls.append(Stall(center_img.x(), center_img.y(), float(theta)))
+        self.default_theta = float(theta)
+        self.set_dirty(True)
+
+
+    # ---------- undo/redo ----------
+
+    def push_undo(self):
+        self._undo_stack.append(list(self.stalls))
+        self._redo_stack.clear()
+
+    def undo(self):
+        if not self._undo_stack:
+            return
+        self._redo_stack.append(list(self.stalls))
+        self.stalls = self._undo_stack.pop()
+        self.set_dirty(True)
+        self.update()
+
+    def redo(self):
+        if not self._redo_stack:
+            return
+        self._undo_stack.append(list(self.stalls))
+        self.stalls = self._redo_stack.pop()
+        self.set_dirty(True)
+        self.update()
+
+    # ---------- stall commit ----------
+
+    def commit_stall(self, center_img: QPointF, dir_img: QPointF):
+        dx = dir_img.x() - center_img.x()
+        dy = dir_img.y() - center_img.y()
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+            return
+        theta = math.atan2(dy, dx)  # signed
+        self.push_undo()
+        self.stalls.append(Stall(center_img.x(), center_img.y(), float(theta)))
+        self.default_theta = float(theta)
+        self.set_dirty(True)
+
+    # ---------- events ----------
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # keep current view if user has panned/zoomed; only fit if no image yet
+        if self.pixmap and self.scale <= 0:
+            self.fit_to_view()
+
+    def wheelEvent(self, event):
+        if not self.pixmap:
+            return
+
+        delta = event.angleDelta().y()
+        if delta == 0:
+            return
+
+        mods = event.modifiers()
+
+        # Ctrl+wheel => zoom
+        if mods & Qt.ControlModifier:
+            factor = 1.15 if delta > 0 else (1 / 1.15)
+
+            cursor_w = QPointF(event.position())
+            cursor_i = self.widget_to_img(cursor_w)
+
+            new_scale = max(0.05, min(12.0, self.scale * factor))
+            self.scale = new_scale
+
+            new_cursor_w = self.img_to_widget(cursor_i)
+            self.offset += (cursor_w - new_cursor_w)
+            self.update()
+            return
+
+        # Otherwise: pan
+        step = 60  # pan speed; tune
+        if mods & Qt.ShiftModifier:
+            # horizontal pan
+            self.offset += QPointF(step if delta > 0 else -step, 0)
+        else:
+            # vertical pan (natural direction optional)
+            self.offset += QPointF(0, step if delta > 0 else -step)
+
+        self.update()
+
+    def zoom_at_center(self, factor: float):
+        if not self.pixmap:
+            return
+
+        center_w = QPointF(self.width() / 2, self.height() / 2)
+        center_i = self.widget_to_img(center_w)
+
+        self.scale = max(0.05, min(12.0, self.scale * factor))
+
+        new_center_w = self.img_to_widget(center_i)
+        self.offset += (center_w - new_center_w)
+        self.clamp_offset()
+        self.update()
+
+
+    def clamp_offset(self):
+        """
+        Prevent the image from being panned completely out of view.
+        Keeps at least a margin of the image visible.
+        """
+        if not self.pixmap:
+            return
+
+        vw, vh = self.width(), self.height()
+        iw = self.pixmap.width() * self.scale
+        ih = self.pixmap.height() * self.scale
+
+        # Allow a small margin so edges can be inspected
+        margin = 80
+
+        if iw <= vw:
+            # Center horizontally
+            ox = (vw - iw) / 2
+        else:
+            min_x = vw - iw - margin
+            max_x = margin
+            ox = min(max(self.offset.x(), min_x), max_x)
+
+        if ih <= vh:
+            # Center vertically
+            oy = (vh - ih) / 2
+        else:
+            min_y = vh - ih - margin
+            max_y = margin
+            oy = min(max(self.offset.y(), min_y), max_y)
+
+        self.offset = QPointF(ox, oy)
+
+
+    def pan_by(self, dx: float, dy: float):
+        self.offset += QPointF(dx, dy)
+        self.clamp_offset()
+        self.update()
+
+    def nearest_stall_index(self, p_img: QPointF):
+        if not self.stalls:
+            return None
+
+        r_screen = 14  # click radius in screen px
+        r_img = r_screen / max(self.scale, 1e-6)
+
+        best_i = None
+        best_d2 = 1e18
+        for i, s in enumerate(self.stalls):
+            dx = p_img.x() - s.x
+            dy = p_img.y() - s.y
+            d2 = dx*dx + dy*dy
+            if d2 < best_d2:
+                best_d2 = d2
+                best_i = i
+
+        if best_d2 <= (r_img * r_img):
+            return best_i
+        return None
+
+
+    def mousePressEvent(self, event):
+        if not self.pixmap:
+            return
+
+        if event.button() == Qt.RightButton and self.center_pt is None and not getattr(self, "_dragging", False):
+            p_img = self.widget_to_img(QPointF(event.position()))
+            idx = self.nearest_stall_index(p_img)
+            if idx is not None:
+                self.push_undo()
+                self.stalls.pop(idx)
+                self.set_dirty(True)
+                self.update()
+            return
+
+
+        if event.button() == Qt.LeftButton and self.center_pt is None:
+            p_img = self.widget_to_img(QPointF(event.position()))
+            idx, mode = self.hit_test(p_img)
+            if idx is not None:
+
+                self.push_undo()
+                self._dragging = True
+                self._drag_idx = idx
+                self._drag_mode = mode
+                self.setCursor(Qt.SizeAllCursor if mode == "center" else Qt.CrossCursor)
+                return
+
+
+        if event.button() == Qt.LeftButton:
+
+
+            p_img = self.widget_to_img(QPointF(event.position()))
+            # If in adjust boundary mode, ignore left-click placement so boundary edits aren't accidental
+            if self.adjust_boundary_mode:
+                return
+
+            if not self.point_inside_boundary(p_img):
+                return  # outside boundary--ignore click
+            self.mouse_pt = p_img
+
+            # If lock orientation is ON, one-click commit (unless Ctrl held)
+            if self.lock_orientation and not (event.modifiers() & Qt.ControlModifier):
+                self.commit_stall_with_theta(p_img, self.default_theta)
+                self.center_pt = None
+                self.update()
+                return
+
+            # normal two-click flow
+            if self.center_pt is None:
+                self.center_pt = p_img
+            else:
+                self.commit_stall(self.center_pt, p_img)
+                self.center_pt = None
+            self.update()
+            return
+
+        # Pan: Space + LMB drag
+        if event.button() == Qt.LeftButton and (event.modifiers() & Qt.KeyboardModifier.SpaceModifier):
+            self._panning = True
+            self._pan_start = QPointF(event.position())
+            self._offset_start = QPointF(self.offset)
+            self.setCursor(Qt.ClosedHandCursor)
+            return
+
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if not self.pixmap:
+            return
+
+        if self._dragging and self._drag_idx is not None:
+            p_img = self.widget_to_img(QPointF(event.position()))
+            s = self.stalls[self._drag_idx]
+
+            if self._drag_mode == "center":
+                # move center
+                s.x = p_img.x()
+                s.y = p_img.y()
+            else:
+                # rotate: recompute theta from center to mouse
+                dx = p_img.x() - s.x
+                dy = p_img.y() - s.y
+                if abs(dx) + abs(dy) > 1e-6:
+                    s.theta = math.atan2(dy, dx) 
+
+            self.set_dirty(True)
+            self.update()
+            return
+
+
+        if self._panning and self._pan_start and self._offset_start:
+            cur = QPointF(event.position())
+            delta = cur - self._pan_start
+            self.offset = self._offset_start + delta
+            self.update()
+            return
+
+        # update preview arrow endpoint
+        self.mouse_pt = self.widget_to_img(QPointF(event.position()))
+        self.update()
+
+
+
+    def mouseReleaseEvent(self, event):
+
+        if self._dragging and event.button() == Qt.LeftButton:
+            self._dragging = False
+            self._drag_idx = None
+            self._drag_mode = None
+            self.unsetCursor()
+            self.update()
+            return
+
+        if self._panning and event.button() == Qt.LeftButton:
+            self._panning = False
+            self._pan_start = None
+            self._offset_start = None
+            self.unsetCursor()
+            self.update()
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        # Esc: cancel in-progress, else undo last stall
+        if event.key() == Qt.Key_Escape:
+            # Cancel in-progress placement
+            if self.center_pt is not None:
+                self.center_pt = None
+                self.mouse_pt = None
+                self.update()
+                return
+
+            # Cancel drag edit
+            if self._dragging:
+                self.undo()   # revert to state before drag
+                self._dragging = False
+                self._drag_idx = None
+                self._drag_mode = None
+                self.unsetCursor()
+                self.update()
+                return
+
+            # Otherwise: undo last committed action
+            self.undo()
+            self.update()
+            return
+
+
+        # 0: fit
+        if event.key() == Qt.Key_0:
+            self.fit_to_view()
+            self.update()
+            return
+
+        # Zoom in / out (keyboard)
+        if event.key() in (Qt.Key_Plus, Qt.Key_Equal):
+            self.zoom_at_center(1.25)
+            return
+
+        if event.key() == Qt.Key_Minus:
+            self.zoom_at_center(1 / 1.25)
+            return
+
+        # Toggle lock orientation
+        if event.key() == Qt.Key_L:
+            self.lock_orientation = not self.lock_orientation
+            self.update()
+            return
+
+        # Toggle boundary adjust mode
+        if event.key() == Qt.Key_B:
+            self.adjust_boundary_mode = not self.adjust_boundary_mode
+            self.update()
+            return
+
+        # Reset boundary adjustment (use 'R' to avoid colliding with 0/fit)
+        if event.key() == Qt.Key_R:
+            self.boundary_dx = 0.0
+            self.boundary_dy = 0.0
+            self.boundary_dtheta = 0.0
+            self.set_dirty(True)
+            self.recompute_adjusted_boundary()
+            self.set_dirty(True)
+            self.update()
+            return
+
+        # If in boundary adjust mode, arrow keys and comma/period adjust the boundary instead of panning
+        if self.adjust_boundary_mode:
+            fast = bool(event.modifiers() & Qt.ShiftModifier)
+            step = 1.0 * (5.0 if fast else 1.0)          # pixels
+            rstep = math.radians(1.0 if fast else 0.25)  # radians
+
+            if event.key() == Qt.Key_Left:
+                self.boundary_dx -= step
+            elif event.key() == Qt.Key_Right:
+                self.boundary_dx += step
+            elif event.key() == Qt.Key_Up:
+                self.boundary_dy -= step
+            elif event.key() == Qt.Key_Down:
+                self.boundary_dy += step
+            elif event.key() == Qt.Key_Comma:
+                self.boundary_dtheta -= rstep
+            elif event.key() == Qt.Key_Period:
+                self.boundary_dtheta += rstep
+            else:
+                super().keyPressEvent(event)
+                return
+
+            self.recompute_adjusted_boundary()
+            self.set_dirty(True)
+            self.update()
+            return
+
+        # Arrow-key panning (normal mode)
+        pan_step = 40
+        fast = event.modifiers() & Qt.ShiftModifier
+        step = pan_step * (3 if fast else 1)
+
+        if event.key() == Qt.Key_Left:
+            self.pan_by(step, 0)
+            return
+        
+        if event.key() == Qt.Key_Right:
+            self.pan_by(-step, 0)
+            return
+        
+        if event.key() == Qt.Key_Up:
+            self.pan_by(0, step)
+            return
+        
+        if event.key() == Qt.Key_Down:
+            self.pan_by(0, -step)
+            return
+
+        if event.key() == Qt.Key_L:
+            self.lock_orientation = not self.lock_orientation
+            self.update()
+            return
+
+        # Toggle boundary adjust mode
+        if event.key() == Qt.Key_B:
+            self.adjust_boundary_mode = not self.adjust_boundary_mode
+            self.update()
+            return
+
+        # Reset boundary adjustment
+        if event.key() == Qt.Key_0:  # pick a key; 9 is arbitrary
+            self.boundary_dx = 0.0
+            self.boundary_dy = 0.0
+            self.boundary_dtheta = 0.0
+            self.set_dirty(True)
+            self.recompute_adjusted_boundary()
+            self.set_dirty(True)
+            self.update()
+            return
+
+        if self.adjust_boundary_mode:
+            fast = bool(event.modifiers() & Qt.ShiftModifier)
+            step = 1.0 * (5.0 if fast else 1.0)          # pixels
+            rstep = math.radians(1.0 if fast else 0.25)  # radians
+
+            if event.key() == Qt.Key_Left:
+                self.boundary_dx -= step
+            elif event.key() == Qt.Key_Right:
+                self.boundary_dx += step
+            elif event.key() == Qt.Key_Up:
+                self.boundary_dy -= step
+            elif event.key() == Qt.Key_Down:
+                self.boundary_dy += step
+            elif event.key() == Qt.Key_Comma:
+                self.boundary_dtheta -= rstep
+            elif event.key() == Qt.Key_Period:
+                self.boundary_dtheta += rstep
+            else:
+                super().keyPressEvent(event)
+                return
+
+            self.recompute_adjusted_boundary()
+            self.set_dirty(True)
+            self.update()
+            return
+
+
+        super().keyPressEvent(event)
+
+    # ---------- painting ----------
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+
+        # background
+        p.fillRect(self.rect(), QColor(20, 20, 20))
+
+        if not self.pixmap:
+            p.setPen(QColor(200, 200, 200))
+            p.drawText(self.rect(), Qt.AlignCenter, "Open an image folder to start.")
+            return
+
+        # draw image
+        target = QRectF(self.offset.x(), self.offset.y(),
+                        self.pixmap.width() * self.scale,
+                        self.pixmap.height() * self.scale)
+        p.drawPixmap(target, self.pixmap, QRectF(0, 0, self.pixmap.width(), self.pixmap.height()))
+
+        # property mask overlay
+        if self.show_prop_mask and self.prop_mask_pixmap:
+            p.setOpacity(0.25)
+            p.drawPixmap(target, self.prop_mask_pixmap, QRectF(0, 0, self.prop_mask_pixmap.width(), self.prop_mask_pixmap.height()))
+            p.setOpacity(1.0)
+
+        # boundary polygon (draw adjusted polygon only)
+        if self.show_boundary and self.boundary_poly_adj:
+            pen = QPen(QColor(255, 80, 80), 3)
+            p.setPen(pen)
+            pts_w = [self.img_to_widget(QPointF(x, y)) for (x, y) in self.boundary_poly_adj]
+            for i in range(len(pts_w)):
+                a = pts_w[i]
+                b = pts_w[(i + 1) % len(pts_w)]
+                p.drawLine(a, b)
+
+
+
+        # draw committed stalls
+        for s in self.stalls:
+            self._draw_stall(p, QPointF(s.x, s.y), s.theta, color=QColor(0, 255, 80))
+
+        # draw in-progress stall preview
+        if self.center_pt is not None and self.mouse_pt is not None:
+            # preview theta
+            dx = self.mouse_pt.x() - self.center_pt.x()
+            dy = self.mouse_pt.y() - self.center_pt.y()
+            if abs(dx) + abs(dy) > 1e-3:
+                theta = math.atan2(dy, dx) % math.pi
+                self._draw_stall(p, self.center_pt, theta, color=QColor(80, 200, 255), preview=True)
+            else:
+                # just center point
+                self._draw_center(p, self.center_pt, QColor(80, 200, 255), preview=True)
+
+        if getattr(self, "skipped", False):
+            p.setOpacity(0.4)
+            p.fillRect(self.rect(), QColor(50, 50, 50))
+            p.setOpacity(1.0)
+            p.setPen(QColor(255, 120, 120))
+            p.setFont(QFont("Arial", 28, QFont.Bold))
+            p.drawText(self.rect(), Qt.AlignCenter, "SKIPPED")
+
+
+        # status text
+        p.setPen(QColor(240, 240, 240))
+        p.setFont(QFont("Arial", 10))
+        status = f"stalls: {len(self.stalls)}"
+        if self.is_dirty():
+            status += "   *unsaved"
+        p.drawText(10, 20, status)
+
+        if self.adjust_boundary_mode:
+            deg = self.boundary_dtheta * 180.0 / math.pi
+            p.setPen(QColor(255, 200, 80))
+            p.drawText(10, 60, f"ADJUST BOUNDARY (B) — arrows/,. adjust: dx={self.boundary_dx:.1f} dy={self.boundary_dy:.1f} dθ={deg:.2f}° (Reset: R)")
+
+
+    def _draw_center(self, painter: QPainter, c_img: QPointF, color: QColor, preview=False):
+        c_w = self.img_to_widget(c_img)
+        r = max(3, int(6 / self.scale))
+        painter.setPen(QPen(color, 2))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawEllipse(c_w, r, r)
+
+    def _draw_arrow(self, painter, c_img, theta, preview=False):
+        c_w = self.img_to_widget(c_img)
+
+        if preview and self.mouse_pt is not None:
+            e_w = self.img_to_widget(self.mouse_pt)
+
+            # clamp preview arrow in screen space
+            vx = e_w.x() - c_w.x()
+            vy = e_w.y() - c_w.y()
+            L = math.hypot(vx, vy)
+
+            if L > 1e-6:
+                Lc = min(max(L, 12), 80)
+                s = Lc / L
+                e_w = QPointF(c_w.x() + vx * s, c_w.y() + vy * s)
+        else:
+            # fixed-length display arrow
+            L = self.arrow_len_px
+            e_w = QPointF(
+                c_w.x() + L * math.cos(theta),
+                c_w.y() + L * math.sin(theta)
+            )
+
+        painter.drawLine(c_w, e_w)
+
+        # arrow head
+        head = 8
+        ang = theta
+        a1 = ang + math.radians(160)
+        a2 = ang - math.radians(160)
+        h1 = QPointF(e_w.x() + head * math.cos(a1), e_w.y() + head * math.sin(a1))
+        h2 = QPointF(e_w.x() + head * math.cos(a2), e_w.y() + head * math.sin(a2))
+        painter.drawLine(e_w, h1)
+        painter.drawLine(e_w, h2)
+
+
+    def _draw_stall(self, painter: QPainter, c_img: QPointF, theta: float, color: QColor, preview=False):
+        c_w = self.img_to_widget(c_img)
+        painter.setPen(QPen(color, 2))
+        painter.setBrush(Qt.NoBrush)
+        r = 4 if not preview else 5
+        painter.drawEllipse(c_w, r, r)
+
+        # clamped arrow length for display (in image space then to widget)
+        self._draw_arrow(painter, c_img, theta, preview)
+
+
+
+# -----------------------------
+# Main window
+# -----------------------------
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Parking Stall Label Tool (center + direction)")
+        self.resize(1200, 800)
+        self.cleaned_cache={}
+        self.images: List[Path] = []
+        self.idx: int = -1
+
+        self.images_dir: Optional[Path] = None
+        self.labels_dir: Optional[Path] = None
+
+        self.canvas = LabelCanvas()
+
+
+        # right panel
+        self.list_widget = QListWidget()
+        self.list_widget.setMinimumWidth(320)
+
+        self.chk_boundary = QCheckBox("Show boundary (O)")
+        self.chk_boundary.setChecked(True)
+        self.chk_mask = QCheckBox("Show property mask overlay (P)")
+        self.chk_mask.setChecked(False)
+
+        self.chk_enhance = QCheckBox("Auto enhance (CLAHE)")
+        self.chk_enhance.setChecked(True)
+        self.chk_enhance.toggled.connect(lambda v: self._refresh_current_image())
+
+        self.btn_open = QPushButton("Open image folder…")
+        self.btn_open.clicked.connect(self.open_project)
+
+        self.btn_save = QPushButton("Save (Ctrl+S)")
+        self.btn_save.clicked.connect(self.save_current)
+
+        self.chk_bad_boundary = QCheckBox("Bad boundary (mark)")
+        self.chk_bad_boundary.setChecked(False)
+        self.chk_bad_boundary.toggled.connect(self.on_toggle_bad_boundary)
+
+        self.lbl_info = QLabel("No folder loaded.")
+        self.lbl_info.setWordWrap(True)
+
+        # quick hints panel (bottom-right)
+        self.hints = QPlainTextEdit()
+        self.hints.setReadOnly(True)
+        self.hints.setMaximumHeight(160)
+        self.hints.setPlainText(self._load_cheatsheet_text())
+        self.hints.setStyleSheet("font-family: monospace; font-size: 11px; background: #f5f5f5; color: #222; padding: 6px;")
+        self.hints.setToolTip("Quick command hints (from stall labeling tool cheat sheet)")
+
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.addWidget(self.chk_enhance)
+        rv.addWidget(self.btn_open)
+        rv.addWidget(self.btn_save)
+        rv.addWidget(self.chk_bad_boundary)
+        rv.addWidget(self.chk_boundary)
+        rv.addWidget(self.chk_mask)
+        rv.addWidget(QLabel("Stalls (current image):"))
+        rv.addWidget(self.list_widget, 1)
+        rv.addWidget(self.lbl_info)
+        rv.addWidget(QLabel("Quick commands:"))
+        rv.addWidget(self.hints)
+
+        self.chk_boundary.toggled.connect(self.on_toggle_boundary)
+        self.chk_mask.toggled.connect(self.on_toggle_mask)
+        # bad-boundary toggle handler
+        self.chk_bad_boundary.toggled.connect(self.on_toggle_bad_boundary)
+
+        splitter = QSplitter()
+        splitter.addWidget(self.canvas)
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 4)
+        splitter.setStretchFactor(1, 1)
+
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.addWidget(splitter)
+        self.setCentralWidget(container)
+
+        # actions / shortcuts
+        self._setup_actions()
+
+        # attempt to auto-load last project now that UI widgets exist
+        try:
+            self._load_global_state()
+        except Exception:
+            pass
+
+    def _setup_actions(self):
+
+        act_open = QAction("Open Folder", self)
+        act_open.setShortcut(QKeySequence.Open)
+        act_open.triggered.connect(self.open_project)
+        self.addAction(act_open)
+
+        act_save = QAction("Save", self)
+        act_save.setShortcut(QKeySequence.Save)
+        act_save.triggered.connect(self.save_current)
+        self.addAction(act_save)
+
+        act_mark_bad = QAction("Toggle Bad Boundary", self)
+        act_mark_bad.setShortcut(QKeySequence("Ctrl+M"))
+        act_mark_bad.triggered.connect(lambda: self.chk_bad_boundary.toggle())
+        self.addAction(act_mark_bad)
+
+        act_next = QAction("Next", self)
+        act_next.setShortcut(Qt.Key_D)
+        act_next.triggered.connect(self.next_image)
+        self.addAction(act_next)
+
+        act_prev = QAction("Prev", self)
+        act_prev.setShortcut(Qt.Key_A)
+        act_prev.triggered.connect(self.prev_image)
+        self.addAction(act_prev)
+
+        act_undo = QAction("Undo", self)
+        act_undo.setShortcut(QKeySequence.Undo)
+        act_undo.triggered.connect(self.canvas.undo)
+        self.addAction(act_undo)
+
+        act_redo = QAction("Redo", self)
+        act_redo.setShortcut(QKeySequence.Redo)
+        act_redo.triggered.connect(self.canvas.redo)
+        self.addAction(act_redo)
+
+        act_boundary = QAction("Toggle Boundary", self)
+        act_boundary.setShortcut(Qt.Key_O)
+        act_boundary.triggered.connect(lambda: self.chk_boundary.toggle())
+        self.addAction(act_boundary)
+
+        act_mask = QAction("Toggle Mask", self)
+        act_mask.setShortcut(Qt.Key_P)
+        act_mask.triggered.connect(lambda: self.chk_mask.toggle())
+        self.addAction(act_mask)
+
+        act_skip = QAction("Toggle Skip", self)
+        act_skip.setShortcut(Qt.Key_K)
+        act_skip.triggered.connect(self.toggle_skip)
+        self.addAction(act_skip)
+
+
+
+
+    # ---------- folder + loading ----------
+
+    def open_project(self):
+        root = QFileDialog.getExistingDirectory(self, "Select project root (or images folder)")
+        if not root:
+            return
+
+        root = Path(root)
+        self._set_project_root(root)
+
+
+    def load_images_from_dir(self, images_dir: Path):
+        exts = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"}
+        self.images = sorted(
+            p for p in images_dir.iterdir()
+            if p.suffix.lower() in exts
+        )
+
+        if not self.images:
+            QMessageBox.warning(self, "No images", f"No images found in:\n{images_dir}")
+            return
+
+        self.idx = 0
+        self.load_index(self.idx)
+
+
+
+    def image_state(self, img_path: Path) -> str:
+        """
+        Returns: 'unlabeled' | 'labeled' | 'skipped'
+        """
+        lp = self.label_path_for(img_path)
+        if not lp.exists():
+            return "unlabeled"
+
+        try:
+            data = json.loads(lp.read_text(encoding="utf-8"))
+        except Exception:
+            return "unlabeled"
+
+        if data.get("skipped", False):
+            return "skipped"
+
+        return "labeled"
+
+
+    def label_path_for(self, img_path: Path) -> Path:
+        assert self.labels_dir is not None
+        return self.labels_dir / f"{img_path.stem}.json"
+    
+    def save_project_state(self):
+        if not hasattr(self, "project_root"):
+            return
+        state = {
+            "last_idx": self.idx,
+            "images_dir": str(self.images_dir) if getattr(self, "images_dir", None) else None
+        }
+        p = self.project_root / ".label_state.json"
+        p.write_text(json.dumps(state), encoding="utf-8")
+        # also save global last project pointer
+        try:
+            home = Path.home()
+            gs = home / ".label_tool_state.json"
+            gs.write_text(json.dumps({"last_project": str(self.project_root)}), encoding="utf-8")
+        except Exception:
+            pass
+
+        # show a brief UI notification when possible
+        try:
+            self.statusBar().showMessage(f"Project state saved (idx {self.idx})", 3000)
+        except Exception:
+            pass
+
+    def _load_global_state(self):
+        try:
+            home = Path.home()
+            gs = home / ".label_tool_state.json"
+            if not gs.exists():
+                return
+            data = json.loads(gs.read_text(encoding="utf-8"))
+            lp = data.get("last_project")
+            if not lp:
+                return
+            p = Path(lp)
+            if p.exists():
+                # silently set project root
+                self._set_project_root(p)
+                # notify user briefly that we auto-opened a project
+                try:
+                    self.statusBar().showMessage(f"Auto-opened project: {p}", 4000)
+                except Exception:
+                    pass
+            else:
+                # invalid path in global state, remove pointer to be safe
+                try:
+                    gs.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        except Exception:
+            return
+
+    def _set_project_root(self, root: Path):
+        """Configure object for project root and load images/state."""
+        root = Path(root)
+        if (root / "images").exists():
+            self.project_root = root
+            self.images_dir = root / "images"
+        else:
+            self.project_root = root
+            self.images_dir = root
+
+        self.labels_dir = self.project_root / "labels"
+        self.masks_dir = self.project_root / "masks"
+        self.boundaries_dir = self.project_root / "boundaries"
+        self.labels_dir.mkdir(exist_ok=True)
+
+        # load images and state
+        self.load_images_from_dir(self.images_dir)
+
+        state_path = self.project_root / ".label_state.json"
+        if state_path.exists():
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                self.last_idx = int(state.get("last_idx", 0))
+            except Exception:
+                self.last_idx = 0
+        else:
+            self.last_idx = 0
+
+        # write a global pointer so next app launch can auto-open this project
+        try:
+            home = Path.home()
+            gs = home / ".label_tool_state.json"
+            gs.write_text(json.dumps({"last_project": str(self.project_root)}), encoding="utf-8")
+        except Exception:
+            pass
+
+        # navigate to saved index if valid
+        try:
+            if hasattr(self, "last_idx") and self.images:
+                if 0 <= self.last_idx < len(self.images):
+                    self.idx = self.last_idx
+                    self.load_index(self.idx)
+        except Exception:
+            pass
+
+
+    def load_index(self, i: int):
+        if i < 0 or i >= len(self.images):
+            return
+
+        # autosave if dirty
+        if self.canvas.is_dirty():
+            self.save_current()
+
+        img_path = self.images[i]
+        image = cv2.imread(str(img_path))
+        if image is None:
+            QMessageBox.critical(self, "Image error", f"Failed to load {img_path}")
+            return
+
+        # load existing labels if present
+        lp = self.label_path_for(img_path)
+        stalls = []
+        needs_review = False
+        notes = ""
+        self.canvas.set_dirty(False)
+        if lp.exists():
+            try:
+                data = json.loads(lp.read_text(encoding="utf-8"))
+                needs_review = bool(data.get("needs_review", False))
+                notes = str(data.get("notes", ""))
+                skipped = bool(data.get("skipped", False))
+                self.canvas.skipped = skipped
+
+                for s in data.get("stalls", []):
+                    stalls.append(Stall(float(s["x"]), float(s["y"]), float(s["theta"])))
+                adj = data.get("boundary_adjust", {})
+                self.canvas.boundary_dx = float(adj.get("dx", 0.0)) #what if isn't there?
+                self.canvas.boundary_dy = float(adj.get("dy", 0.0))
+                self.canvas.boundary_dtheta = float(adj.get("dtheta", 0.0))
+                # support saved bad-boundary flag
+                self.canvas.boundary_bad = bool(data.get("boundary_bad", False))
+                try:
+                    self.chk_bad_boundary.setChecked(self.canvas.boundary_bad)
+                except Exception:
+                    pass
+            except Exception as e:
+                QMessageBox.warning(self, "Label load error", f"Failed to load {lp.name}:\n{e}")
+        poly = self.canvas.load_boundary_polygon(img_path)
+        # fallback: attempt to auto-detect red-painted boundary if no meta found
+        if poly is None:
+            try:
+                detected, conf = self.canvas.detect_boundary_from_image(image)
+                if detected is not None:
+                    poly = detected
+                    # write generated meta file if none exists
+                    jp = img_path.with_name(f"{img_path.stem}_meta.json")
+                    try:
+                        if not jp.exists():
+                            payload = {
+                                "boundary_pixel_coords": [[float(x), float(y)] for x, y in poly],
+                                "generated_by": "auto_detect_v1",
+                                "confidence": float(conf),
+                            }
+                            jp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                            try:
+                                self.statusBar().showMessage(f"Auto-detected boundary saved: {jp.name}", 4000)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        if poly is not None:
+            image = self.canvas.erase_boundary_on_open(
+                image,
+                poly,
+                thickness=10,
+                pad=60
+            )
+        self.canvas.set_image(image, img_path, enhance=self.chk_enhance.isChecked())
+        self.canvas.set_boundary_polygon(poly)
+        self.canvas.recompute_adjusted_boundary()
+        self.cleaned_cache[img_path] = image
+        self.canvas.set_labels(stalls)
+        self.refresh_list()
+        self._update_title()
+        boundary_present = "yes" if poly is not None else "no"
+        self.lbl_info.setText(f"{img_path.name}\nlabels: {len(stalls)}\n{lp.name}\nboundary: {boundary_present}")
+        self.canvas.setFocus()
+        # persist project state (current index / images_dir)
+        try:
+            self.save_project_state()
+        except Exception:
+            pass
+
+
+    def _refresh_current_image(self):
+        """Reapply display settings (enhancement) to the current image without changing labels.
+        Called when the 'Auto enhance' checkbox is toggled."""
+        # reload cheatsheet text in case it changed on disk
+        try:
+            self.hints.setPlainText(self._load_cheatsheet_text())
+        except Exception:
+            pass
+        if not self.images or self.idx < 0:
+            return
+        img_path = self.images[self.idx]
+        image = self.cleaned_cache.get(img_path)
+        if image is None:
+            image = cv2.imread(str(img_path))
+            if image is None:
+                return
+        self.canvas.set_image(image, img_path, enhance=self.chk_enhance.isChecked())
+        # restore boundary and adjustments
+        poly = self.canvas.load_boundary_polygon(img_path)
+        self.canvas.set_boundary_polygon(poly)
+        self.canvas.recompute_adjusted_boundary()
+        self.canvas.set_labels(self.canvas.stalls)
+        # restore bad-boundary checkbox from saved labels if present
+        try:
+            lp = self.label_path_for(img_path)
+            if lp.exists():
+                data = json.loads(lp.read_text(encoding="utf-8"))
+                bad = bool(data.get("boundary_bad", False))
+                self.chk_bad_boundary.setChecked(bad)
+                self.canvas.boundary_bad = bad
+        except Exception:
+            pass
+        self.canvas.setFocus()
+
+    def _update_title(self):
+        if self.idx >= 0 and self.images:
+            self.setWindowTitle(f"Label Tool — {self.images[self.idx].name} ({self.idx+1}/{len(self.images)})")
+
+    def _load_cheatsheet_text(self) -> str:
+        """Load a short cheat-sheet from disk if available, else return a built-in short help string."""
+        try:
+            base = Path(__file__).resolve().parents[1]
+            p = base / "stall labeling tool cheat sheet.txt"
+            if p.exists():
+                txt = p.read_text(encoding="utf-8")
+                # keep only the first ~20 lines for the quick hints panel
+                lines = txt.strip().splitlines()
+                short = "\n".join(line.rstrip() for line in lines[:20])
+                return short
+        except Exception:
+            pass
+
+        # fallback short help
+        return "A/D: prev/next  |  +/-: zoom  |  0: fit  |  Space+drag: pan  |  B: adjust boundary  |  R: reset"
+
+    # ---------- navigation ----------
+
+    def next_image(self):
+        if not self.images:
+            return
+        if self.idx < len(self.images) - 1:
+            self.idx += 1
+            self.load_index(self.idx)
+
+    def prev_image(self):
+        if not self.images:
+            return
+        if self.idx > 0:
+            self.idx -= 1
+            self.load_index(self.idx)
+
+    # ---------- save / list ----------
+
+    def save_current(self):
+        if not self.images or self.idx < 0:
+            return
+        img_path = self.images[self.idx]
+        lp = self.label_path_for(img_path)
+
+        payload = ImageLabels(
+            image_path=str(img_path),
+            stalls=self.canvas.stalls,
+            boundary_adjust={
+                "dx": float(self.canvas.boundary_dx),
+                "dy": float(self.canvas.boundary_dy),
+                "dtheta": float(self.canvas.boundary_dtheta),
+            },            
+            skipped=getattr(self.canvas, "skipped", False),
+            ).to_json()
+
+        lp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self.canvas.set_dirty(False)
+        self.refresh_list()
+        self.lbl_info.setText(f"{img_path.name}\nlabels: {len(self.canvas.stalls)}\nSaved ✓ -> {lp.name}")
+
+        # persist project state when saving labels so last index and folder are stored
+        self.save_project_state()
+
+    def refresh_list(self):
+        self.list_widget.clear()
+        for k, s in enumerate(self.canvas.stalls):
+            deg = s.theta * 180.0 / math.pi
+            item = QListWidgetItem(f"{k:03d}: x={s.x:.1f}, y={s.y:.1f}, θ={deg:.1f}°")
+            self.list_widget.addItem(item)
+
+    # ---------- overlay toggles ----------
+
+    def on_toggle_boundary(self, v: bool):
+        self.canvas.show_boundary = v
+        self.canvas.update()
+
+    def on_toggle_mask(self, v: bool):
+        self.canvas.show_prop_mask = v
+        self.canvas.update()
+
+    def toggle_skip(self):
+        if self.idx < 0 or not self.images:
+            return
+
+        # If marking skipped, clear stalls
+        if not getattr(self.canvas, "skipped", False):
+            self.canvas.push_undo()
+            self.canvas.stalls = []
+            self.canvas.skipped = True
+        else:
+            self.canvas.skipped = False
+
+        self.canvas.set_dirty(True)
+        self.canvas.update()
+        self.refresh_list()
+
+    def closeEvent(self, event):
+        """Handle window close: automatically save unsaved changes and persist project state."""
+        
+        try:
+            if getattr(self.canvas, "is_dirty", lambda: False)() and self.images and self.idx >= 0:
+                self.save_current()
+        except Exception:
+            # ignore and continue with close
+            pass
+
+        # persist project state (last idx / images_dir)
+        try:
+            self.save_project_state()
+        except Exception:
+            pass
+
+        event.accept()
+
+
+def main():
+    app = QApplication([])
+    w = MainWindow()
+    w.show()
+    # ensure image is fit to the window after the event loop starts (fixes load-time sizing)
+    try:
+        QTimer.singleShot(0, w.canvas.fit_to_view)
+    except Exception:
+        pass
+    app.exec()
+
+
+if __name__ == "__main__":
+    main()

@@ -1463,7 +1463,14 @@ class MainWindow(QMainWindow):
         # Only include images that have an exact matching *_meta.json in the same folder.
         # Only include images that have a matching *_meta.json either in the
         # images folder itself _or_ in the configured boundaries folder.
+        #
+        # Use fuzzy matching: accept exact "{stem}_meta.json" OR any *_meta.json
+        # whose stem (with or without the trailing "_meta") is a substring of the
+        # image stem (or vice versa).  This handles filename differences like
+        # images that include a country suffix ("_United_States") while the
+        # metadata file does not.
         def has_meta(p: Path) -> bool:
+            # quick exact checks first
             if p.with_name(f"{p.stem}_meta.json").exists():
                 return True
             bd = getattr(self, "boundaries_dir", None)
@@ -1474,6 +1481,25 @@ class MainWindow(QMainWindow):
                         return True
                 except Exception:
                     pass
+
+            # fuzzy search in the image folder and the boundaries folder (if present)
+            folders = [p.parent]
+            if bd:
+                try:
+                    folders.append(Path(bd))
+                except Exception:
+                    pass
+
+            for folder in folders:
+                if not folder or not folder.exists():
+                    continue
+                for q in folder.glob("*_meta.json"):
+                    s = q.stem
+                    s_no_meta = s[:-5] if s.endswith("_meta") else s
+                    img_stem = p.stem
+                    if s in img_stem or s_no_meta in img_stem or img_stem in s:
+                        return True
+
             return False
 
         self.images = sorted(
@@ -1644,6 +1670,18 @@ class MainWindow(QMainWindow):
         # autosave if dirty
         if self.canvas.is_dirty():
             self.save_current()
+
+        # pre-clear canvas state to avoid stale overlays if loading fails later
+        try:
+            self.canvas.set_labels([])
+            self.canvas.skipped = False
+            self.canvas.boundary_bad = False
+            try:
+                self.chk_bad_boundary.setChecked(False)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
         img_path = self.images[i]
         image = cv2.imread(str(img_path))

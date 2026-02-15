@@ -1314,6 +1314,9 @@ class MainWindow(QMainWindow):
         self.btn_save = QPushButton("Save (Ctrl+S)")
         self.btn_save.clicked.connect(self.save_current)
 
+        self.btn_delete_stall = QPushButton("Delete stall (Del)")
+        self.btn_delete_stall.clicked.connect(self.delete_selected_stall)
+
         self.chk_bad_boundary = QCheckBox("Bad boundary (mark)")
         self.chk_bad_boundary.setChecked(False)
         self.chk_bad_boundary.toggled.connect(self.on_toggle_bad_boundary)
@@ -1335,6 +1338,7 @@ class MainWindow(QMainWindow):
         rv.addWidget(self.btn_open)
         rv.addWidget(self.btn_open_boundaries)
         rv.addWidget(self.btn_save)
+        rv.addWidget(self.btn_delete_stall)
         rv.addWidget(self.chk_bad_boundary)
         rv.addWidget(self.chk_boundary)
         rv.addWidget(self.chk_mask)
@@ -1414,6 +1418,11 @@ class MainWindow(QMainWindow):
         act_mask.setShortcut(Qt.Key_P)
         act_mask.triggered.connect(lambda: self.chk_mask.toggle())
         self.addAction(act_mask)
+
+        act_delete = QAction("Delete Stall", self)
+        act_delete.setShortcut(QKeySequence.Delete)
+        act_delete.triggered.connect(self.delete_selected_stall)
+        self.addAction(act_delete)
 
         act_skip = QAction("Toggle Skip", self)
         act_skip.setShortcut(Qt.Key_K)
@@ -1849,6 +1858,32 @@ class MainWindow(QMainWindow):
             deg = s.theta * 180.0 / math.pi
             item = QListWidgetItem(f"{k:03d}: x={s.x:.1f}, y={s.y:.1f}, θ={deg:.1f}°")
             self.list_widget.addItem(item)
+
+    def delete_selected_stall(self):
+        """Delete the currently selected stall in the side list or the last stall.
+
+        This updates the canvas model, marks the canvas dirty, and refreshes UI.
+        """
+        if not self.images or self.idx < 0:
+            return
+
+        sel = self.list_widget.currentRow()
+        if sel is None or sel < 0:
+            # no explicit selection — remove the last stall if present
+            if not self.canvas.stalls:
+                return
+            self.canvas.push_undo()
+            self.canvas.stalls.pop()
+        else:
+            if 0 <= sel < len(self.canvas.stalls):
+                self.canvas.push_undo()
+                self.canvas.stalls.pop(sel)
+            else:
+                return
+
+        self.canvas.set_dirty(True)
+        self.canvas.update()
+        self.refresh_list()
 
     # ---------- overlay toggles ----------
 

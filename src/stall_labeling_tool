@@ -1707,6 +1707,24 @@ class MainWindow(QMainWindow):
         if lp.exists():
             try:
                 data = json.loads(lp.read_text(encoding="utf-8"))
+
+                # Safety: ensure the saved label file actually refers to this image. If
+                # the JSON's `image_path` points to another image (moved/renamed files
+                # or mistakenly copied label files), ignore the saved stalls to avoid
+                # loading incorrect labels.
+                saved_img_path = data.get("image_path")
+                if saved_img_path:
+                    try:
+                        if Path(saved_img_path).stem != img_path.stem:
+                            # mismatch -> ignore saved stalls
+                            self.statusBar().showMessage(
+                                f"Ignored mismatched label file: {lp.name}", 4000
+                            )
+                            data = {"stalls": [], "boundary_adjust": {}}
+                    except Exception:
+                        # best-effort only
+                        pass
+
                 needs_review = bool(data.get("needs_review", False))
                 notes = str(data.get("notes", ""))
                 skipped = bool(data.get("skipped", False))

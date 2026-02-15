@@ -1319,7 +1319,6 @@ class MainWindow(QMainWindow):
         self.chk_boundary.toggled.connect(self.on_toggle_boundary)
         self.chk_mask.toggled.connect(self.on_toggle_mask)
         # bad-boundary toggle handler
-        self.chk_bad_boundary.toggled.connect(self.on_toggle_bad_boundary)
 
         splitter = QSplitter()
         splitter.addWidget(self.canvas)
@@ -1409,13 +1408,14 @@ class MainWindow(QMainWindow):
 
     def load_images_from_dir(self, images_dir: Path):
         exts = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"}
+        # Only include images that have an exact matching *_meta.json in the same folder.
         self.images = sorted(
             p for p in images_dir.iterdir()
-            if p.suffix.lower() in exts
+            if p.suffix.lower() in exts and (p.with_name(f"{p.stem}_meta.json").exists())
         )
 
         if not self.images:
-            QMessageBox.warning(self, "No images", f"No images found in:\n{images_dir}")
+            QMessageBox.warning(self, "No images", f"No images with matching *_meta.json found in:\n{images_dir}")
             return
 
         self.idx = 0
@@ -1586,30 +1586,7 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 QMessageBox.warning(self, "Label load error", f"Failed to load {lp.name}:\n{e}")
         poly = self.canvas.load_boundary_polygon(img_path)
-        # fallback: attempt to auto-detect red-painted boundary if no meta found
-        if poly is None:
-            try:
-                detected, conf = self.canvas.detect_boundary_from_image(image)
-                if detected is not None:
-                    poly = detected
-                    # write generated meta file if none exists
-                    jp = img_path.with_name(f"{img_path.stem}_meta.json")
-                    try:
-                        if not jp.exists():
-                            payload = {
-                                "boundary_pixel_coords": [[float(x), float(y)] for x, y in poly],
-                                "generated_by": "auto_detect_v1",
-                                "confidence": float(conf),
-                            }
-                            jp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-                            try:
-                                self.statusBar().showMessage(f"Auto-detected boundary saved: {jp.name}", 4000)
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+        # Do not attempt auto-detection. Images without explicit *_meta.json files will not be processed.
 
         if poly is not None:
             image = self.canvas.erase_boundary_on_open(
@@ -1721,8 +1698,9 @@ class MainWindow(QMainWindow):
                 "dx": float(self.canvas.boundary_dx),
                 "dy": float(self.canvas.boundary_dy),
                 "dtheta": float(self.canvas.boundary_dtheta),
-            },            
+            },
             skipped=getattr(self.canvas, "skipped", False),
+            boundary_bad=bool(getattr(self.canvas, "boundary_bad", False)),
             ).to_json()
 
         lp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -1748,6 +1726,17 @@ class MainWindow(QMainWindow):
 
     def on_toggle_mask(self, v: bool):
         self.canvas.show_prop_mask = v
+        self.canvas.update()
+
+    def on_toggle_bad_boundary(self, v: bool):
+        """Mark/unmark the loaded boundary as incorrect (affects saved labels)."""
+        try:
+            # update model and mark as dirty so user saves the change
+            self.canvas.boundary_bad = bool(v)
+            self.canvas.set_dirty(True)
+        except Exception:
+            pass
+        # refresh canvas display
         self.canvas.update()
 
     def toggle_skip(self):

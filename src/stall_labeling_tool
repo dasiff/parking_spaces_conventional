@@ -302,57 +302,80 @@ class LabelCanvas(QWidget):
     def boundary_path_for_image(self, img_path: Path) -> Path:
         return img_path.with_name(f"{img_path.stem}_meta.json")
 
-    def load_boundary_polygon(self, img_path: Path):
+    def load_boundary_polygon(self, img_path: Path, boundaries_dir: Path = None):
         """
         Returns polygon as list[(x,y)] in IMAGE PIXEL coords.
-        This supports several common JSON schemas; extend as needed.
+
+        Lookup order:
+          1. exact match in provided `boundaries_dir` (if given)
+          2. fuzzy match in `boundaries_dir` (stem contains/matches)
+          3. exact match in the image's folder
+          4. fuzzy match in the image's folder
+
+        This keeps backward compatibility while preferring an external boundaries
+        folder when configured.
         """
+        # helper to parse a candidate json path
+        def _load_pts(p: Path):
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                return None
+            pts = None
+            if isinstance(data, dict):
+                if "boundary_pixel_coords" in data:
+                    pts = data["boundary_pixel_coords"]
+                elif "polygon" in data:
+                    pts = data["polygon"]
+                elif "points" in data:
+                    pts = data["points"]
+                elif "boundary" in data and isinstance(data["boundary"], dict) and "pixel_coords" in data["boundary"]:
+                    pts = data["boundary"]["pixel_coords"]
+            elif isinstance(data, list):
+                pts = data
+            if not pts:
+                return None
+            return [(float(x), float(y)) for x, y in pts]
+
+        # 1/2) try boundaries_dir first (exact -> fuzzy)
+        if boundaries_dir:
+            try:
+                bd = Path(boundaries_dir)
+                if bd.exists():
+                    cand = bd / f"{img_path.stem}_meta.json"
+                    if cand.exists():
+                        return _load_pts(cand)
+                    for p in bd.glob("*_meta.json"):
+                        try:
+                            s = p.stem
+                            s_no_meta = s[:-5] if s.endswith("_meta") else s
+                            img_stem = img_path.stem
+                            if s in img_stem or s_no_meta in img_stem or img_stem in s:
+                                pts = _load_pts(p)
+                                if pts:
+                                    return pts
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+        # 3/4) fallback: look in same folder as the image
         jp = self.boundary_path_for_image(img_path)
         if not jp.exists():
-            # try to find a same-folder candidate of form *_meta.json with a similar stem
             for p in img_path.parent.glob("*_meta.json"):
                 try:
                     s = p.stem
                     s_no_meta = s[:-5] if s.endswith("_meta") else s
                     img_stem = img_path.stem
                     if s in img_stem or s_no_meta in img_stem or img_stem in s:
-                        jp = p
-                        break
+                        pts = _load_pts(p)
+                        if pts:
+                            return pts
                 except Exception:
-                    print("no source found for border")
                     continue
-
-        if not jp.exists():
             return None
 
-        data = json.loads(jp.read_text(encoding="utf-8"))
-        # remember which file we used
-
-        # Try several common keys/formats (pixel coords expected):
-        # - 'boundary_pixel_coords': [[x,y],...]
-        # - 'polygon': [[x,y],...]
-        # - 'points': [[x,y],...]
-        # - top-level list: [[x,y],...]
-        pts = None
-
-        if isinstance(data, dict):
-            if "boundary_pixel_coords" in data:
-                pts = data["boundary_pixel_coords"]
-            elif "polygon" in data:
-                pts = data["polygon"]
-            elif "points" in data:
-                pts = data["points"]
-            # some files nest polygon under other keys
-            elif "boundary" in data and isinstance(data["boundary"], dict) and "pixel_coords" in data["boundary"]:
-                pts = data["boundary"]["pixel_coords"]
-        elif isinstance(data, list):
-            pts = data
-
-        if not pts:
-            # Not recognized
-            return None
-
-        return [(float(x), float(y)) for x, y in pts]
+        return _load_pts(jp)
 
     def detect_boundary_from_image(self, image_bgr: np.ndarray):
         """Attempt to detect a bright-red boundary painted around the parking lot.
@@ -1264,6 +1287,7 @@ class MainWindow(QMainWindow):
 
         self.images_dir: Optional[Path] = None
         self.labels_dir: Optional[Path] = None
+        self.boundaries_dir: Optional[Path] = None
 
         self.canvas = LabelCanvas()
 
@@ -1283,6 +1307,9 @@ class MainWindow(QMainWindow):
 
         self.btn_open = QPushButton("Open image folder…")
         self.btn_open.clicked.connect(self.open_project)
+
+        self.btn_open_boundaries = QPushButton("Open boundary folder…")
+        self.btn_open_boundaries.clicked.connect(self.open_boundaries_folder)
 
         self.btn_save = QPushButton("Save (Ctrl+S)")
         self.btn_save.clicked.connect(self.save_current)
@@ -1306,6 +1333,7 @@ class MainWindow(QMainWindow):
         rv = QVBoxLayout(right)
         rv.addWidget(self.chk_enhance)
         rv.addWidget(self.btn_open)
+        rv.addWidget(self.btn_open_boundaries)
         rv.addWidget(self.btn_save)
         rv.addWidget(self.chk_bad_boundary)
         rv.addWidget(self.chk_boundary)
@@ -1403,15 +1431,54 @@ class MainWindow(QMainWindow):
             return
 
         root = Path(root)
+        # set images/project root but defer image loading until a boundaries folder is set
         self._set_project_root(root)
+
+    def open_boundaries_folder(self):
+        """Let user pick a separate folder that contains *_meta.json boundary files.
+
+        If an images directory is already selected, images will be (re)loaded now.
+        """
+        bd = QFileDialog.getExistingDirectory(self, "Select boundaries folder")
+        if not bd:
+            return
+        bd = Path(bd)
+        self.boundaries_dir = bd
+        try:
+            self.statusBar().showMessage(f"Boundaries folder set: {bd}", 3000)
+        except Exception:
+            pass
+        # persist this choice for the project
+        try:
+            self.save_project_state()
+        except Exception:
+            pass
+        # if images already selected, (re)load them now that boundaries are known
+        if getattr(self, "images_dir", None) and Path(self.images_dir).exists():
+            self.load_images_from_dir(self.images_dir)
 
 
     def load_images_from_dir(self, images_dir: Path):
         exts = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"}
         # Only include images that have an exact matching *_meta.json in the same folder.
+        # Only include images that have a matching *_meta.json either in the
+        # images folder itself _or_ in the configured boundaries folder.
+        def has_meta(p: Path) -> bool:
+            if p.with_name(f"{p.stem}_meta.json").exists():
+                return True
+            bd = getattr(self, "boundaries_dir", None)
+            if bd:
+                try:
+                    bdp = Path(bd)
+                    if (bdp / f"{p.stem}_meta.json").exists():
+                        return True
+                except Exception:
+                    pass
+            return False
+
         self.images = sorted(
             p for p in images_dir.iterdir()
-            if p.suffix.lower() in exts and (p.with_name(f"{p.stem}_meta.json").exists())
+            if p.suffix.lower() in exts and has_meta(p)
         )
 
         if not self.images:
@@ -1451,7 +1518,8 @@ class MainWindow(QMainWindow):
             return
         state = {
             "last_idx": self.idx,
-            "images_dir": str(self.images_dir) if getattr(self, "images_dir", None) else None
+            "images_dir": str(self.images_dir) if getattr(self, "images_dir", None) else None,
+            "boundaries_dir": str(self.boundaries_dir) if getattr(self, "boundaries_dir", None) else None,
         }
         p = self.project_root / ".label_state.json"
         p.write_text(json.dumps(state), encoding="utf-8")
@@ -1498,7 +1566,11 @@ class MainWindow(QMainWindow):
             return
 
     def _set_project_root(self, root: Path):
-        """Configure object for project root and load images/state."""
+        """Configure object for project root and load images/state.
+
+        IMPORTANT: do not load images until a boundaries folder is present (either the
+        conventional <project>/boundaries subfolder or a user-selected path).
+        """
         root = Path(root)
         if (root / "images").exists():
             self.project_root = root
@@ -1509,21 +1581,43 @@ class MainWindow(QMainWindow):
 
         self.labels_dir = self.project_root / "labels"
         self.masks_dir = self.project_root / "masks"
-        self.boundaries_dir = self.project_root / "boundaries"
+        default_boundaries = self.project_root / "boundaries"
         self.labels_dir.mkdir(exist_ok=True)
 
-        # load images and state
-        self.load_images_from_dir(self.images_dir)
-
+        # restore per-project state (if present) so we can honor a previously set
+        # boundaries folder; fall back to the conventional subfolder otherwise
         state_path = self.project_root / ".label_state.json"
         if state_path.exists():
             try:
                 state = json.loads(state_path.read_text(encoding="utf-8"))
                 self.last_idx = int(state.get("last_idx", 0))
+                bd = state.get("boundaries_dir")
+                if bd:
+                    bd_path = Path(bd)
+                    # prefer saved boundaries_dir when it still exists
+                    if bd_path.exists():
+                        self.boundaries_dir = bd_path
+                    else:
+                        self.boundaries_dir = default_boundaries
+                else:
+                    self.boundaries_dir = default_boundaries
             except Exception:
                 self.last_idx = 0
+                self.boundaries_dir = default_boundaries
         else:
             self.last_idx = 0
+            self.boundaries_dir = default_boundaries
+
+        # Only load images when both images_dir and boundaries_dir are present.
+        # This ensures the UI only lists images after the user has set the
+        # boundaries folder (per your request).
+        if getattr(self, "boundaries_dir", None) and Path(self.boundaries_dir).exists():
+            self.load_images_from_dir(self.images_dir)
+        else:
+            try:
+                self.statusBar().showMessage("Select a boundaries folder to load images", 4000)
+            except Exception:
+                pass
 
         # write a global pointer so next app launch can auto-open this project
         try:
@@ -1585,7 +1679,7 @@ class MainWindow(QMainWindow):
                     pass
             except Exception as e:
                 QMessageBox.warning(self, "Label load error", f"Failed to load {lp.name}:\n{e}")
-        poly = self.canvas.load_boundary_polygon(img_path)
+        poly = self.canvas.load_boundary_polygon(img_path, boundaries_dir=getattr(self, 'boundaries_dir', None))
         # Do not attempt auto-detection. Images without explicit *_meta.json files will not be processed.
 
         if poly is not None:
@@ -1630,7 +1724,7 @@ class MainWindow(QMainWindow):
                 return
         self.canvas.set_image(image, img_path, enhance=self.chk_enhance.isChecked())
         # restore boundary and adjustments
-        poly = self.canvas.load_boundary_polygon(img_path)
+        poly = self.canvas.load_boundary_polygon(img_path, boundaries_dir=getattr(self, 'boundaries_dir', None))
         self.canvas.set_boundary_polygon(poly)
         self.canvas.recompute_adjusted_boundary()
         self.canvas.set_labels(self.canvas.stalls)

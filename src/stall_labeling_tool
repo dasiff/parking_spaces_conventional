@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 import numpy as np
 import cv2
-from PySide6.QtCore import Qt, QPointF, QRectF, QSize, QTimer
+from PySide6.QtCore import Qt, QPointF, QRectF, QSize, QTimer, Signal
 from PySide6.QtGui import (
     QAction, QImage, QColor, QFont, QKeySequence, QPainter, QPen, QPixmap
 )
@@ -79,7 +79,13 @@ class LabelCanvas(QWidget):
       - click center then click direction
       - preview arrow follows mouse after first click
       - zoom/pan
+
+    Emits:
+      - stalls_changed: emitted whenever `self.stalls` is modified so the host
+        window can refresh side-lists / persist state as needed.
     """
+
+    stalls_changed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -175,6 +181,11 @@ class LabelCanvas(QWidget):
         self.set_dirty(False)
         self.center_pt = None
         self.mouse_pt = None
+        # notify host so list view stays in sync
+        try:
+            self.stalls_changed.emit()
+        except Exception:
+            pass
         self.update()
 
     def _stall_tip_point(self, s: Stall, L: float) -> QPointF:
@@ -697,6 +708,10 @@ class LabelCanvas(QWidget):
         self.stalls.append(Stall(center_img.x(), center_img.y(), float(theta)))
         self.default_theta = float(theta)
         self.set_dirty(True)
+        try:
+            self.stalls_changed.emit()
+        except Exception:
+            pass
 
 
     # ---------- undo/redo ----------
@@ -711,6 +726,10 @@ class LabelCanvas(QWidget):
         self._redo_stack.append(list(self.stalls))
         self.stalls = self._undo_stack.pop()
         self.set_dirty(True)
+        try:
+            self.stalls_changed.emit()
+        except Exception:
+            pass
         self.update()
 
     def redo(self):
@@ -719,6 +738,10 @@ class LabelCanvas(QWidget):
         self._undo_stack.append(list(self.stalls))
         self.stalls = self._redo_stack.pop()
         self.set_dirty(True)
+        try:
+            self.stalls_changed.emit()
+        except Exception:
+            pass
         self.update()
 
     # ---------- stall commit ----------
@@ -865,6 +888,11 @@ class LabelCanvas(QWidget):
                 self.push_undo()
                 self.stalls.pop(idx)
                 self.set_dirty(True)
+                # notify host so side-list / other UI can update immediately
+                try:
+                    self.stalls_changed.emit()
+                except Exception:
+                    pass
                 self.update()
             return
 
@@ -1290,6 +1318,11 @@ class MainWindow(QMainWindow):
         self.boundaries_dir: Optional[Path] = None
 
         self.canvas = LabelCanvas()
+        # keep the side-list in sync whenever the canvas changes its stalls
+        try:
+            self.canvas.stalls_changed.connect(self.refresh_list)
+        except Exception:
+            pass
 
 
         # right panel
@@ -1685,6 +1718,11 @@ class MainWindow(QMainWindow):
             self.canvas.set_labels([])
             self.canvas.skipped = False
             self.canvas.boundary_bad = False
+            # Ensure lock-orientation does NOT persist between images
+            try:
+                self.canvas.lock_orientation = False
+            except Exception:
+                pass
             try:
                 self.chk_bad_boundary.setChecked(False)
             except Exception:
@@ -1831,6 +1869,12 @@ class MainWindow(QMainWindow):
     def next_image(self):
         if not self.images:
             return
+        # autosave any unsaved changes before navigating
+        try:
+            if self.canvas.is_dirty():
+                self.save_current()
+        except Exception:
+            pass
         if self.idx < len(self.images) - 1:
             self.idx += 1
             self.load_index(self.idx)
@@ -1838,6 +1882,12 @@ class MainWindow(QMainWindow):
     def prev_image(self):
         if not self.images:
             return
+        # autosave any unsaved changes before navigating
+        try:
+            if self.canvas.is_dirty():
+                self.save_current()
+        except Exception:
+            pass
         if self.idx > 0:
             self.idx -= 1
             self.load_index(self.idx)
